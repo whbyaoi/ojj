@@ -34,6 +34,28 @@ type Sender interface {
 	SendText(context.Context, qq.TextMessage) (qq.SentMessage, error)
 }
 
+// AttachmentSender is optional; text-only senders remain valid. An implementation
+// uploads without sending, then sends once, returning only the final send ACK.
+// Upload credentials must never be returned as a SentMessage.
+type AttachmentSender interface {
+	SendAttachment(context.Context, qq.AttachmentMessage) (qq.SentMessage, error)
+}
+
+// SupportsAttachments forwards an optional capability veto through wrappers.
+// Implementing AttachmentSender alone is sufficient unless explicitly disabled.
+func (p *Policy) SupportsAttachments() bool {
+	if p == nil || nilSender(p.sender) {
+		return false
+	}
+	if _, ok := p.sender.(AttachmentSender); !ok {
+		return false
+	}
+	if capability, ok := p.sender.(interface{ SupportsAttachments() bool }); ok {
+		return capability.SupportsAttachments()
+	}
+	return true
+}
+
 type Config struct {
 	Path, AccountID                                       string
 	BotUserID                                             string
@@ -92,7 +114,7 @@ func (c Config) normalized() (Config, error) {
 	return c, nil
 }
 
-// Policy is safe for concurrent Bind, SendText and Close. Close cancels in-flight
+// Policy is safe for concurrent Bind, SendText, SendAttachment and Close. Close cancels in-flight
 // operations and waits for Sender to return; Sender must honor context cancellation.
 type Policy struct {
 	generation int64 // Immutable after Open; fences every state transaction.
@@ -416,7 +438,39 @@ func (p *Policy) Precheck(ctx context.Context) (ready bool, err error) {
 // unknown sends retain both quota and idempotency; changing MsgSeq cannot retry.
 // After a platform ACK, policy skips only suppress session updates. Storage errors
 // remain errors, but retain the acknowledged result and never mean "not sent".
-func (p *Policy) SendText(ctx context.Context, msg qq.TextMessage) (result qq.SentMessage, err error) {
+func (p *Policy) SendText(ctx context.Context, msg qq.TextMessage) (qq.SentMessage, error) {
+	return p.send(ctx, msg.TargetType, msg.TargetID, msg.MsgID, func() string {
+		if qq.ValidateTextMessage(msg) != nil {
+			return "invalid_reply_parameters"
+		}
+		return ""
+	}, func(op context.Context) (qq.SentMessage, error) {
+		return p.sender.SendText(op, msg)
+	})
+}
+
+// SendAttachment shares text authorization, durable quotas and idempotency.
+// Validation/capability checks precede reservation; the entire upload/send call
+// is conservatively Started, but only its final nonempty send ACK is Confirmed.
+// The host owns attachment allowlisting. No failure refunds or retries occur here.
+func (p *Policy) SendAttachment(ctx context.Context, msg qq.AttachmentMessage) (qq.SentMessage, error) {
+	return p.send(ctx, msg.TargetType, msg.TargetID, msg.MsgID, func() string {
+		if qq.ValidateAttachmentMessage(msg) != nil {
+			return "invalid_reply_parameters"
+		}
+		if !p.SupportsAttachments() {
+			return "attachments_unsupported"
+		}
+		return ""
+	}, func(op context.Context) (qq.SentMessage, error) {
+		return p.sender.(AttachmentSender).SendAttachment(op, msg)
+	})
+}
+
+// send is the single authorization/reservation/ACK path for every payload kind.
+func (p *Policy) send(ctx context.Context, targetType, targetID, msgID string,
+	validate func() string, deliver func(context.Context) (qq.SentMessage, error),
+) (result qq.SentMessage, err error) {
 	started := time.Now()
 	stage, outcome, reason := "send", "not_sent", "operation_unavailable"
 	defer func() {
@@ -446,16 +500,20 @@ func (p *Policy) SendText(ctx context.Context, msg qq.TextMessage) (result qq.Se
 		reason = "binding_owner_mismatch"
 		return qq.SentMessage{}, ErrSkipped
 	}
-	if msg.MsgID == "" || qq.ValidateTextMessage(msg) != nil {
+	if msgID == "" {
 		reason = "invalid_reply_parameters"
+		return qq.SentMessage{}, ErrSkipped
+	}
+	if validationReason := validate(); validationReason != "" {
+		reason = validationReason
 		return qq.SentMessage{}, ErrSkipped
 	}
 	if b.reason != "" {
 		reason = b.reason
 		return qq.SentMessage{}, ErrSkipped
 	}
-	target := digest(p.cfg.AccountID, msg.TargetType, msg.TargetID)
-	message := digest(target, msg.MsgID)
+	target := digest(p.cfg.AccountID, targetType, targetID)
+	message := digest(target, msgID)
 	chosen, ok := b.candidates[message]
 	reason = "candidate_not_in_binding"
 	if !ok || chosen.target != target || chosen.message != message {
@@ -480,7 +538,7 @@ func (p *Policy) SendText(ctx context.Context, msg qq.TextMessage) (result qq.Se
 	}
 	outcome, reason = "unknown", "transport_error"
 	replydelivery.Started(ctx)
-	sent, err := p.sender.SendText(op, msg)
+	sent, err := deliver(op)
 	if strings.TrimSpace(sent.ID) != "" {
 		replydelivery.Confirmed(ctx)
 	}

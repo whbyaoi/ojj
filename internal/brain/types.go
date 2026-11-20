@@ -42,9 +42,11 @@ func WithModelSkipped(ctx context.Context, skipped bool) context.Context {
 // Stored images may expire or become inaccessible to the model provider.
 // MaxContextBytes counts SystemPrompt plus canonical message JSON at every model
 // request; exceeding it fails rather than truncating messages. Only the current
-// input's images are loaded; historical images are omitted before counting bytes.
+// input's images are loaded. Historical images, tool calls and tool results are
+// omitted before counting bytes; visible assistant prose is retained unless not sent.
 // MaxHistoryMessages bounds initial history loading, including the current input.
-// Only the newest complete succeeded tasks fitting this limit are retained.
+// Only the newest complete succeeded tasks fitting this limit are retained;
+// this record count is applied before historical content filtering.
 // Messages generated during the current task are not subject to this count limit.
 // Open's context bounds opening only; Run's context controls scheduling.
 type Config struct {

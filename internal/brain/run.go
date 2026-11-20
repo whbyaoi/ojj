@@ -101,8 +101,8 @@ func (r *Region) history(parent context.Context, in Input) (minipi.Context, erro
 		return history, ErrContextCapacity
 	}
 	// Select newest message IDs first, then drop the oldest task if its initial
-	// user message (turn 0) is outside the window. Never orphan tool results or
-	// tool calls, and never load unbounded message bodies just to discard them.
+	// user message (turn 0) is outside the window. Select complete tasks before
+	// filtering historical tools; never load unbounded bodies to discard them.
 	rows, err := r.db.QueryContext(ctx, `
 WITH recent AS (
  SELECT m.sequence, m.input_id, m.turn, i.sequence AS input_sequence, i.qq_delivery
@@ -129,20 +129,25 @@ ORDER BY r.input_sequence, r.sequence`, in.Sequence, in.ID, r.cfg.MaxHistoryMess
 			return history, err
 		}
 		message := decodeMessage(m)
-		suppressAssistant := inputID != in.ID && delivery == replydelivery.NotSent && message.Role == minipi.RoleAssistant
-		if suppressAssistant {
-			// Keep the original audit record and complete tool chains. Only the
-			// model's historical assistant prose is suppressed.
-			if len(message.ToolCalls) == 0 {
+		if inputID != in.ID {
+			// Filter only the model's copy; current tool rounds and audit records
+			// retain their complete calls and results, including tool errors.
+			if message.Role == minipi.RoleTool ||
+				(delivery == replydelivery.NotSent && message.Role == minipi.RoleAssistant) {
 				continue
 			}
-			message.Content = ""
+			if len(message.ToolCalls) > 0 {
+				message.ToolCalls = nil
+				if message.Content == "" && len(message.Images) == 0 {
+					continue
+				}
+			}
 		}
 		if inputID != in.ID && len(message.Images) > 0 {
 			// Filter only the model's copy. Persisted snapshots remain intact for
 			// recovery and idempotency; current-window tool rounds keep images.
 			message.Images = nil
-			if message.Content == "" && !suppressAssistant {
+			if message.Content == "" {
 				message.Content = "[历史图片未加载]"
 			}
 		}

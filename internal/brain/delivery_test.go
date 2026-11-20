@@ -197,16 +197,12 @@ func TestDeliveryHistoryAndRestart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var expected []minipi.Message
-			for _, stored := range original {
-				m := decodeMessage(stored.Message)
-				if wantState == replydelivery.NotSent && m.Role == minipi.RoleAssistant {
-					if len(m.ToolCalls) == 0 {
-						continue
-					}
-					m.Content = ""
+			expected := []minipi.Message{{Role: minipi.RoleUser, Content: "question"}}
+			if wantState != replydelivery.NotSent {
+				if name != "no_tool" {
+					expected = append(expected, minipi.Message{Role: minipi.RoleAssistant, Content: "I already sent the reply"})
 				}
-				expected = append(expected, m)
+				expected = append(expected, minipi.Message{Role: minipi.RoleAssistant, Content: "I did not send anything"})
 			}
 			expected = append(expected, minipi.Message{Role: minipi.RoleUser, Content: "next question"})
 			if !reflect.DeepEqual(history.Messages, expected) {

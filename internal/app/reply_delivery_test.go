@@ -290,24 +290,23 @@ func TestReplyDeliveryHistoryEndToEnd(t *testing.T) {
 					if replydelivery.Outcome(ctx) != replydelivery.NotSent {
 						t.Error("new input inherited old delivery")
 					}
-					count := 5
-					if name == "no_tool" {
+					count := 4
+					if want == replydelivery.NotSent {
 						count = 2
-					} else if want == replydelivery.NotSent {
-						count = 4
 					}
 					if len(req.Messages) != count {
 						t.Errorf("history length=%d, want %d", len(req.Messages), count)
-					} else if name != "no_tool" {
-						text := "claimed sent"
-						if want == replydelivery.NotSent {
-							text = ""
+					} else if want != replydelivery.NotSent {
+						if req.Messages[1].Content != "claimed sent" || req.Messages[2].Content != "claimed not sent" {
+							t.Error("sent or uncertain assistant prose was removed")
 						}
-						if req.Messages[1].Content != text || len(req.Messages[1].ToolCalls) != 1 || req.Messages[2].ToolCallID != "send" {
-							t.Error("historical assistant/tool chain mismatch")
+					}
+					for _, m := range req.Messages {
+						if m.Role == minipi.RoleTool || len(m.ToolCalls) != 0 || m.ToolCallID != "" {
+							t.Error("historical tool call or result reached model")
 						}
-						if want != replydelivery.NotSent && req.Messages[3].Content != "claimed not sent" {
-							t.Error("sent or uncertain assistant result was removed")
+						if want == replydelivery.NotSent && m.Role == minipi.RoleAssistant {
+							t.Error("not-sent assistant prose reached model")
 						}
 					}
 				}

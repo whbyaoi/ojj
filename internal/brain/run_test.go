@@ -669,7 +669,7 @@ func TestHistoryMessageLimit(t *testing.T) {
 	}
 }
 
-func TestHistoryLimitKeepsToolTaskWhole(t *testing.T) {
+func TestHistoryLimitSelectsWholeTaskBeforeFilteringTools(t *testing.T) {
 	ctx := context.Background()
 	cfg := testConfig(t, modelFunc(func(context.Context, minipi.Request, func(minipi.Message)) (minipi.Response, error) {
 		return answer("unused"), nil
@@ -701,13 +701,20 @@ func TestHistoryLimitKeepsToolTaskWhole(t *testing.T) {
 		}
 		want := 1
 		if limit == 5 {
-			want = 5
+			want = 3
 		}
 		if len(history.Messages) != want {
 			t.Fatalf("limit %d: got %d", limit, len(history.Messages))
 		}
-		if limit == 5 && (history.Messages[1].ToolCalls[0].ID != "call" || history.Messages[2].ToolCallID != "call") {
-			t.Fatal("tool pair changed")
+		expected := []minipi.Message{{Role: minipi.RoleUser, Content: "current"}}
+		if limit == 5 {
+			expected = append([]minipi.Message{
+				{Role: minipi.RoleUser, Content: "question"},
+				{Role: minipi.RoleAssistant, Content: "done"},
+			}, expected...)
+		}
+		if !reflect.DeepEqual(history.Messages, expected) {
+			t.Fatalf("limit %d: unexpected filtered history: %+v", limit, history.Messages)
 		}
 	}
 	if len(messages(t, r, "tool-task")) != 4 {

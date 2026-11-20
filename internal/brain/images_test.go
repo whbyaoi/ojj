@@ -175,11 +175,11 @@ func TestImagesStayWithinWindowAcrossToolRounds(t *testing.T) {
 		awaitRun(t, done)
 		for turn := 0; turn < 2; turn++ {
 			req := <-requests
-			if len(req.Messages) != i*4+1+turn*2 {
+			if len(req.Messages) != i*2+1+turn*2 {
 				t.Fatal("unexpected window history length")
 			}
 			for j, m := range req.Messages {
-				if j == i*4 {
+				if j == i*2 {
 					if m.Content != id || !slices.Equal(m.Images, brainTestImages()[i:i+1]) {
 						t.Fatal("current window lost images across tool rounds")
 					}
@@ -197,7 +197,7 @@ func TestImagesStayWithinWindowAcrossToolRounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	history, err := r.history(ctx, in)
-	if err != nil || len(history.Messages) != 9 {
+	if err != nil || len(history.Messages) != 5 {
 		t.Fatal("failed to load complete window history", err)
 	}
 	budget := len(history.SystemPrompt)

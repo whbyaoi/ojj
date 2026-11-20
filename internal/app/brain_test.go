@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +25,7 @@ const testSystemPrompt = mainSystemPrompt + "\n\n## 人格设定（服从宿主�
 func brainTestEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{"OJJ_MODEL_PROTOCOL", "OPENAI_TOKEN_LIMIT_FIELD", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "OJJ_BRAIN_DB", "OJJ_BRAIN_MAX_INPUT_BYTES", "OJJ_BRAIN_MAX_CONTEXT_BYTES", "OJJ_BRAIN_MAX_HISTORY_MESSAGES", "OJJ_BRAIN_MAX_STORED_BYTES", "OJJ_QQ_SEND_ALLOWLIST", "OJJ_ENABLE_COMMAND", "OJJ_COMMAND_DIR", "OJJ_MESSAGE_DB", "OJJ_MESSAGE_QUIET_PERIOD", "OJJ_MESSAGE_MAX_WINDOW", "OJJ_HEARTBEAT_INTERVAL",
+		"OJJ_ENABLE_MEM0", "OJJ_MEM0_BASE_URL", "OJJ_MEM0_API_KEY", "OJJ_MEM0_TIMEOUT",
 		"OJJ_REPLY_DB", "OJJ_REPLY_BOT_USER_ID", "OJJ_REPLY_ALIASES", "OJJ_REPLY_PROACTIVE",
 		"OJJ_REPLY_ACTIVE_INTERVAL", "OJJ_REPLY_ACTIVE_WINDOW", "OJJ_REPLY_ACTIVE_LIMIT",
 		"OJJ_REPLY_SESSION_TTL", "OJJ_REPLY_TOTAL_WINDOW", "OJJ_REPLY_TOTAL_LIMIT"} {
@@ -109,6 +113,131 @@ func TestMainBrainConfig(t *testing.T) {
 	cfg, allowed, err = mainBrainConfig("events.db")
 	if err != nil || len(cfg.Agent.Tools) != 1 || cfg.Agent.Tools[0].Definition.Name != "command_exec" || len(allowed) != 2 || cfg.MaxHistoryMessages != 25 {
 		t.Fatalf("overrides: %+v %v %v", cfg, allowed, err)
+	}
+}
+
+func TestMem0StartupConfiguration(t *testing.T) {
+	for _, tc := range []struct{ key, value string }{
+		{"OJJ_ENABLE_MEM0", "invalid-private-value"},
+		{"OJJ_MEM0_BASE_URL", ""},
+		{"OJJ_MEM0_BASE_URL", "ftp://invalid-private-value"},
+		{"OJJ_MEM0_API_KEY", ""},
+		{"OJJ_MEM0_API_KEY", "invalid-private-value\n"},
+		{"OJJ_MEM0_TIMEOUT", "invalid-private-value"},
+		{"OJJ_MEM0_TIMEOUT", "0s"},
+		{"OJJ_MEM0_TIMEOUT", "-1s"},
+		{"OJJ_MEM0_TIMEOUT", "1ns"},
+		{"OJJ_MEM0_TIMEOUT", "6m"},
+	} {
+		t.Run(tc.key+tc.value, func(t *testing.T) {
+			brainTestEnv(t)
+			t.Setenv("OJJ_ENABLE_MEM0", "true")
+			t.Setenv("OJJ_MEM0_BASE_URL", "http://example.invalid")
+			t.Setenv("OJJ_MEM0_API_KEY", "synthetic-key")
+			t.Setenv(tc.key, tc.value)
+			dir := t.TempDir()
+			t.Setenv("OJJ_EVENT_DB", filepath.Join(dir, "events.db"))
+			var logs bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+			defer slog.SetDefault(old)
+			if err := Run(context.Background()); err == nil || strings.Contains(err.Error(), "invalid-private-value") || strings.Contains(err.Error(), "synthetic-key") {
+				t.Fatal("invalid mem0 configuration accepted or leaked")
+			}
+			if !strings.Contains(logs.String(), `"stage":"brain_config"`) || strings.Contains(logs.String(), "invalid-private-value") || strings.Contains(logs.String(), "synthetic-key") || strings.Contains(logs.String(), "example.invalid") {
+				t.Fatal("missing safe startup diagnostics")
+			}
+			if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+				t.Fatal("opened storage before validation")
+			}
+		})
+	}
+	brainTestEnv(t)
+	t.Setenv("OJJ_MEM0_BASE_URL", "invalid-private-value")
+	t.Setenv("OJJ_MEM0_API_KEY", "invalid-private-value\n")
+	t.Setenv("OJJ_MEM0_TIMEOUT", "invalid-private-value")
+	cfg, _, err := mainBrainConfig("unused.db")
+	if err != nil || len(cfg.Agent.Tools) != 0 {
+		t.Fatal("disabled mem0 should ignore its settings")
+	}
+}
+
+func TestMem0ConfiguredAgentCallsOnDemand(t *testing.T) {
+	brainTestEnv(t)
+	var memoryRequests, modelRequests atomic.Int32
+	memoryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		memoryRequests.Add(1)
+		if r.Method != http.MethodPost || r.Header.Get("X-API-Key") != "synthetic-key" {
+			t.Error("incorrect memory request")
+		}
+		var body json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error("invalid memory request body")
+			w.WriteHeader(400)
+			return
+		}
+		switch r.URL.Path {
+		case "/memories":
+			if string(body) != `{"messages":[{"role":"user","content":"likes tea"}],"agent_id":"ojj"}` {
+				t.Error("incorrect fixed add scope")
+			}
+			fmt.Fprint(w, `{"results":[{"id":"saved-1","event":"ADD"}]}`)
+		case "/search":
+			if string(body) != `{"query":"tea","filters":{"agent_id":"ojj"}}` {
+				t.Error("incorrect fixed search scope")
+			}
+			fmt.Fprint(w, `{"results":[{"id":"saved-1","memory":"likes tea","agent_id":"ojj"}]}`)
+		default:
+			t.Error("unexpected memory path")
+			w.WriteHeader(404)
+		}
+	}))
+	defer memoryServer.Close()
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Tools    []struct{ Function struct{ Name string } }
+			Messages []struct{ Role, Content, ToolCallID string }
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		if len(body.Tools) != 2 || body.Tools[0].Function.Name != "mem0_add_memory" || body.Tools[1].Function.Name != "mem0_search_memory" {
+			t.Error("missing memory tools in model request")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch modelRequests.Add(1) {
+		case 1:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"add-1","type":"function","function":{"name":"mem0_add_memory","arguments":"{\"messages\":[{\"role\":\"user\",\"content\":\"likes tea\"}]}"}},{"id":"search-1","type":"function","function":{"name":"mem0_search_memory","arguments":"{\"query\":\"tea\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+		default:
+			if modelRequests.Load() == 2 && (len(body.Messages) != 5 || body.Messages[3].Role != "tool" || !strings.Contains(body.Messages[3].Content, "saved-1") || body.Messages[4].Role != "tool" || !strings.Contains(body.Messages[4].Content, "likes tea")) {
+				t.Error("missing memory results in tool round")
+			}
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":2}}`)
+		}
+	}))
+	defer modelServer.Close()
+	t.Setenv("OJJ_ENABLE_MEM0", "true")
+	t.Setenv("OJJ_MEM0_BASE_URL", memoryServer.URL)
+	t.Setenv("OJJ_MEM0_API_KEY", "synthetic-key")
+	t.Setenv("OPENAI_BASE_URL", modelServer.URL+"/v1")
+	cfg, _, err := mainBrainConfig("unused.db")
+	if err != nil || memoryRequests.Load() != 0 {
+		t.Fatal("configuration failed or accessed memory at startup")
+	}
+	agent, err := minipi.New(cfg.Agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		_, err = agent.Run(context.Background(), minipi.Context{SystemPrompt: cfg.SystemPrompt}, []minipi.Message{{Role: minipi.RoleUser, Content: "synthetic request"}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if memoryRequests.Load() != 2 || modelRequests.Load() != 3 {
+		t.Fatal("memory should only be accessed for explicit tool calls")
 	}
 }
 
