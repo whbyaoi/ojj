@@ -1,0 +1,19 @@
+# 本地构建产物
+/bin/
+/ojj
+*.test
+/coverage.out
+.joycode
+
+# 运行数据与本地配置
+/data/
+*.log
+.env
+.env.*
+!.env.example
+
+# 本机工具与系统文件
+.joycode/memory/
+.DS_Store
+
+*.db*
